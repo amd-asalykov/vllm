@@ -111,13 +111,20 @@ def enable_act_fusion(cfg: "VllmConfig") -> bool:
 
 
 def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
-    """Enable if TP > 1 and Hopper/Blackwell and flashinfer installed."""
+    """Enable if TP > 1 and either:
+    - CUDA + Hopper/Blackwell + flashinfer (original path), or
+    - ROCm + AITER enabled (new AITER fused AR+RMSNorm path).
+    """
+    from vllm._aiter_ops import rocm_aiter_ops
     from vllm.platforms import current_platform
     from vllm.utils.flashinfer import has_flashinfer
 
-    return (
-        cfg.parallel_config.tensor_parallel_size > 1
-        and current_platform.is_cuda()
+    tp_gt1 = cfg.parallel_config.tensor_parallel_size > 1
+    no_dp = cfg.parallel_config.data_parallel_size == 1
+    no_pp = cfg.parallel_config.pipeline_parallel_size == 1
+
+    cuda_path = (
+        current_platform.is_cuda()
         and has_flashinfer()
         and (
             current_platform.is_device_capability(100)
@@ -125,11 +132,18 @@ def enable_allreduce_rms_fusion(cfg: "VllmConfig") -> bool:
         )
         # tp-dp combination broken:
         # https://github.com/vllm-project/vllm/issues/34458
-        and cfg.parallel_config.data_parallel_size == 1
+        and no_dp
         # tp-pp combination broken:
         # https://github.com/vllm-project/vllm/issues/35426
-        and cfg.parallel_config.pipeline_parallel_size == 1
+        and no_pp
     )
+
+    rocm_aiter_path = (
+        current_platform.is_rocm()
+        and rocm_aiter_ops.is_enabled()
+    )
+
+    return tp_gt1 and (cuda_path or rocm_aiter_path)
 
 
 def enable_rope_kvcache_fusion(cfg: "VllmConfig") -> bool:
@@ -1451,15 +1465,16 @@ class VllmConfig:
         Set the compile ranges for the compilation config.
         """
         compilation_config = self.compilation_config
-        computed_compile_ranges_endpoints = []
+        computed_compile_ranges_split_points = []
 
         # The upper bound of the compile ranges is the max_num_batched_tokens.
         compile_range_end = self.scheduler_config.max_num_batched_tokens
         if compile_range_end is not None:
-            computed_compile_ranges_endpoints.append(compile_range_end)
+            computed_compile_ranges_split_points.append(compile_range_end)
 
-        # Add the compile ranges for flashinfer
-        if compilation_config.pass_config.fuse_allreduce_rms:
+        # Add the compile ranges for flashinfer allreduce fusion (CUDA only)
+        from vllm.platforms import current_platform
+        if compilation_config.pass_config.fuse_allreduce_rms and current_platform.is_cuda():
             tp_size = self.parallel_config.tensor_parallel_size
             max_size = compilation_config.pass_config.flashinfer_max_size(tp_size)
             if max_size is not None:
@@ -1468,11 +1483,39 @@ class VllmConfig:
                     * self.model_config.dtype.itemsize
                 )
                 if compile_range_end is not None and max_token_num < compile_range_end:
-                    computed_compile_ranges_endpoints.append(max_token_num)
+                    computed_compile_ranges_split_points.append(max_token_num)
                 else:
                     logger.debug(
                         "Max num batched tokens below allreduce-rms fusion threshold, "
                         "allreduce-rms fusion will be enabled for all num_tokens."
+                    )
+
+        # Add a compile range split point for ROCm AITER fused allreduce+RMSNorm.
+        # The AITER allreduce buffer is fixed-size (128 MB), so the fusion pass can
+        # only run for compile ranges whose end <= max_token_num (buffer capacity).
+        # Without this split, the single range [1, max_num_batched_tokens] always
+        # exceeds the buffer capacity and the fusion pass is never applied.
+        # The split creates [1, max_token_num] (fusion active) and
+        # [max_token_num+1, max_num_batched_tokens] (fusion skipped for large prefills).
+        if compilation_config.pass_config.fuse_allreduce_rms and current_platform.is_rocm():
+            from vllm._aiter_ops import rocm_aiter_ops
+            if rocm_aiter_ops.is_enabled():
+                aiter_max_size = rocm_aiter_ops.get_aiter_allreduce_max_size()
+                hidden_dim = self.model_config.get_hidden_size()
+                element_size = self.model_config.dtype.itemsize
+                aiter_max_token_num = (aiter_max_size // 2) // (hidden_dim * element_size)
+                if compile_range_end is not None and aiter_max_token_num < compile_range_end:
+                    computed_compile_ranges_split_points.append(aiter_max_token_num)
+                    logger.debug(
+                        "ROCm AITER allreduce fusion: added compile range split at %d "
+                        "(buffer capacity %d MB, hidden_dim=%d).",
+                        aiter_max_token_num, aiter_max_size // (1024 * 1024), hidden_dim,
+                    )
+                else:
+                    logger.debug(
+                        "ROCm AITER allreduce fusion: max_num_batched_tokens (%d) <= "
+                        "aiter_max_token_num (%d), fusion enabled for all tokens.",
+                        compile_range_end, aiter_max_token_num,
                     )
 
         # Add the compile ranges for sequence parallelism
@@ -1500,10 +1543,10 @@ class VllmConfig:
                 and min_token_num < max_num_batched_tokens
                 and min_token_num > 1
             ):
-                # Add endpoint at min_token_num - 1 to ensure SP applies
+                # Add split point at min_token_num - 1 to ensure SP applies
                 # starting from min_token_num
                 # This creates ranges: [1, min-1] (no SP), [min, max] (SP applies)
-                computed_compile_ranges_endpoints.append(min_token_num - 1)
+                computed_compile_ranges_split_points.append(min_token_num - 1)
 
         if compilation_config.pass_config.fuse_rope_kvcache:
             max_token_num = (
@@ -1511,7 +1554,7 @@ class VllmConfig:
             )
             if max_token_num is not None:
                 if compile_range_end is not None and max_token_num < compile_range_end:
-                    computed_compile_ranges_endpoints.append(max_token_num)
+                    computed_compile_ranges_split_points.append(max_token_num)
                 else:
                     logger.debug(
                         "Max num batched tokens below rope+kvcache fusion threshold, "
@@ -1522,11 +1565,11 @@ class VllmConfig:
         if compilation_config.compile_ranges_endpoints is not None:
             for x in compilation_config.compile_ranges_endpoints:
                 assert isinstance(x, int)
-                assert x > 0, f"Invalid compile range endpoint: {x}"
+                assert x > 0, f"Invalid compile range split point: {x}"
                 if compile_range_end is not None and x < compile_range_end and x > 1:
-                    computed_compile_ranges_endpoints.append(x)
+                    computed_compile_ranges_split_points.append(x)
         compilation_config.compile_ranges_endpoints = sorted(
-            computed_compile_ranges_endpoints
+            computed_compile_ranges_split_points
         )
 
     def try_verify_and_update_config(self):

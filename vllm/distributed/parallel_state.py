@@ -483,7 +483,14 @@ class GroupCoordinator:
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with torch.cuda.stream(stream), maybe_ca_context:
+        maybe_aiter_context = nullcontext()
+        from vllm._aiter_ops import rocm_aiter_ops
+        if rocm_aiter_ops.is_enabled():
+            aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
+            if aiter_ar is not None:
+                maybe_aiter_context = aiter_ar.capture()  # type: ignore
+
+        with torch.cuda.stream(stream), maybe_ca_context, maybe_aiter_context:
             yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:

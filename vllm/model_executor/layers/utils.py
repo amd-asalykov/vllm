@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utility methods for model layers."""
 
+import os
+
 from collections.abc import Callable
 
 import torch
@@ -15,6 +17,12 @@ from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
+
+try:
+    from aiter.tuned_gemm import tgemm as _TGEMM
+    _TUNED_GEMM_A16W16 = _TGEMM.mm
+except Exception:
+    _TUNED_GEMM_A16W16 = None
 
 MOE_LAYER_ROUTER_GATE_SUFFIXES = {
     "gate",
@@ -128,7 +136,18 @@ def rocm_unquantized_gemm_impl(
     m = weight.shape[0]
     k = weight.shape[1]
 
+    if (
+        _TUNED_GEMM_A16W16 is not None
+        and x.dtype is torch.bfloat16
+        and weight.is_contiguous()
+    ):
+        return _TUNED_GEMM_A16W16(x, weight, bias)
+
     cu_count = num_compute_units()
+    if use_aiter_triton_gemm(n, m, k, x.dtype):
+        from aiter.ops.triton.gemm_a16w16 import gemm_a16w16
+
+        return gemm_a16w16(x, weight, bias)
 
     # Next ^2 of n
     N_p2 = 1 << (n - 1).bit_length()
